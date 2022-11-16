@@ -18,6 +18,7 @@
 //! Physical query planner
 
 use super::analyze::AnalyzeExec;
+use super::common;
 use super::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use super::{
     aggregates, empty::EmptyExec, joins::PartitionMode, udaf, union::UnionExec,
@@ -25,7 +26,7 @@ use super::{
 };
 use crate::config::{OPT_EXPLAIN_LOGICAL_PLAN_ONLY, OPT_EXPLAIN_PHYSICAL_PLAN_ONLY};
 use crate::datasource::source_as_provider;
-use crate::execution::context::{ExecutionProps, SessionState};
+use crate::execution::context::{ExecutionProps, SessionContext, SessionState};
 use crate::logical_expr::utils::generate_sort_key;
 use crate::logical_expr::{
     Aggregate, Distinct, EmptyRelation, Join, Projection, Sort, SubqueryAlias, TableScan,
@@ -66,6 +67,7 @@ use datafusion_expr::expr_rewriter::unnormalize_cols;
 use datafusion_expr::utils::expand_wildcard;
 use datafusion_expr::{WindowFrame, WindowFrameBound};
 use datafusion_optimizer::utils::unalias;
+use datafusion_physical_expr::exists_subquery::{exists_subquery, ExistsSubqueryExpr};
 use datafusion_physical_expr::expressions::Literal;
 use datafusion_sql::utils::window_expr_common_partition_keys;
 use futures::future::BoxFuture;
@@ -757,12 +759,46 @@ impl DefaultPhysicalPlanner {
                     let input_schema = physical_input.as_ref().schema();
                     let input_dfschema = filter.input().schema();
 
-                    let runtime_expr = self.create_physical_expr(
+                    let mut runtime_expr = self.create_physical_expr(
                         filter.predicate(),
                         input_dfschema,
                         &input_schema,
                         session_state,
                     )?;
+
+                    // For uncorrelated exists subquery, create the physical plan here.
+                    // Then execute the subquery's physical plan, get the num of rows.
+                    if runtime_expr.as_any().is::<ExistsSubqueryExpr>() {
+                        let exists_subquery_expr = runtime_expr.as_any().downcast_ref::<ExistsSubqueryExpr>().unwrap();
+                        let exists_subquery_physical_plan = self.create_initial_plan(exists_subquery_expr.input(), session_state).await?;
+                        let session_ctx = SessionContext::new();
+                        let task_ctx = session_ctx.task_ctx();
+                        let iter = exists_subquery_physical_plan.execute(0, task_ctx)?;
+                        let batches = common::collect(iter).await?;
+                        let num_rows: usize = batches.into_iter().map(|b| b.num_rows()).sum();
+
+                        let result;
+                        // If num_rows is greater than zero, the exists subquery should return true;
+                        // the not exists subquery should return false.
+                        // If num_rows is equal to zero, the exists subquery should return false;
+                        // the not exists subquery should return true.
+                        if num_rows > 0 {
+                            if exists_subquery_expr.negated() {
+                                result = false;
+                            } else {
+                                result = true;
+                            }
+                        } else {
+                            if exists_subquery_expr.negated() {
+                                result = true;
+                            } else {
+                                result = false;
+                            }
+                        }
+
+                        runtime_expr = exists_subquery(&exists_subquery_expr.input(), exists_subquery_expr.negated(), true, result)?;
+                    }
+
                     Ok(Arc::new(FilterExec::try_new(runtime_expr, physical_input)?))
                 }
                 LogicalPlan::Union(Union { inputs, .. }) => {

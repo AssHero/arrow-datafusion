@@ -23,6 +23,7 @@ pub mod crypto_expressions;
 pub mod datetime_expressions;
 pub mod equivalence;
 pub mod execution_props;
+pub mod exists_subquery;
 pub mod expressions;
 pub mod functions;
 pub mod hash_utils;

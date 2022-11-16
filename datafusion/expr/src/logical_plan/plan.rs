@@ -21,7 +21,8 @@ use crate::logical_plan::builder::validate_unique_names;
 use crate::logical_plan::display::{GraphvizVisitor, IndentVisitor};
 use crate::logical_plan::extension::UserDefinedLogicalNode;
 use crate::utils::{
-    exprlist_to_fields, grouping_set_expr_count, grouping_set_to_exprlist,
+    expr_to_columns, exprlist_to_fields, grouping_set_expr_count,
+    grouping_set_to_exprlist,
 };
 use crate::{Expr, ExprSchemable, TableProviderFilterPushDown, TableSource};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -348,6 +349,32 @@ impl LogicalPlan {
         };
         self.accept(&mut visitor)?;
         Ok(visitor.using_columns)
+    }
+
+    /// returns all Filter columns in a logical plan
+    pub fn filter_columns(&self) -> Result<Vec<HashSet<Column>>, DataFusionError> {
+        struct FilterColumnVisitor {
+            filter_columns: Vec<HashSet<Column>>,
+        }
+
+        impl PlanVisitor for FilterColumnVisitor {
+            type Error = DataFusionError;
+
+            fn pre_visit(&mut self, plan: &LogicalPlan) -> Result<bool, Self::Error> {
+                if let LogicalPlan::Filter(Filter { predicate, .. }) = plan {
+                    let mut cols = HashSet::new();
+                    expr_to_columns(predicate, &mut cols)?;
+                    self.filter_columns.push(cols);
+                }
+                Ok(true)
+            }
+        }
+
+        let mut visitor = FilterColumnVisitor {
+            filter_columns: vec![],
+        };
+        self.accept(&mut visitor)?;
+        Ok(visitor.filter_columns)
     }
 }
 

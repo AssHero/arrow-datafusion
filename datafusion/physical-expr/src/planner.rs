@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::exists_subquery::{exists_subquery, is_uncorrelated_subquery};
 use crate::var_provider::is_system_variables;
 use crate::{
     execution_props::ExecutionProps,
@@ -414,6 +415,18 @@ pub fn create_physical_expr(
                 expressions::in_list(value_expr, list_exprs, negated, input_schema)
             }
         },
+        Expr::Exists { subquery, negated } => {
+            let uncorrelated_subquery = is_uncorrelated_subquery(subquery);
+            // only support uncorrelated exists subquery
+            if uncorrelated_subquery.is_ok() && uncorrelated_subquery.unwrap() {
+                exists_subquery(&subquery.subquery, *negated, false, false)
+            } else {
+                Err(DataFusionError::NotImplemented(format!(
+                    "Physical plan does not support logical expression {:?}",
+                    e
+                )))
+            }
+        }
         other => Err(DataFusionError::NotImplemented(format!(
             "Physical plan does not support logical expression {:?}",
             other
